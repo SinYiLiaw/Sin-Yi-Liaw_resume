@@ -1,0 +1,680 @@
+
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = blob-${Date.now()}-${Math.random()};
+          pendingBlobs.set(blobId, blob);
+          return blob-request://${blobId};
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = fetch-${id}-${Date.now()};
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+
+start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+
+if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sin Yi Liaw - Resume</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: white;
+            padding: 40px;
+            max-width: 850px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            display: flex;
+            align-items: center;
+            gap: 30px;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 3px solid #2c3e50;
+        }
+        
+        .photo-placeholder {
+            width: 150px;
+            height: 150px;
+            border-radius: 50%;
+            border: 4px dashed #3498db;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #ecf0f1;
+            text-align: center;
+            font-size: 12px;
+            color: #7f8c8d;
+            padding: 20px;
+        }
+        
+        .header-text {
+            flex: 1;
+        }
+        
+        h1 {
+            font-size: 32px;
+            color: #2c3e50;
+            margin-bottom: 10px;
+        }
+        
+        .contact-info {
+            font-size: 14px;
+            color: #555;
+            margin-top: 10px;
+        }
+        
+        .contact-info a {
+            color: #3498db;
+            text-decoration: none;
+        }
+        
+        h2 {
+            font-size: 20px;
+            color: #2c3e50;
+            margin-top: 25px;
+            margin-bottom: 15px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #3498db;
+        }
+        
+        .section {
+            margin-bottom: 25px;
+        }
+        
+        .job {
+            margin-bottom: 20px;
+        }
+        
+        .job-title {
+            font-weight: bold;
+            font-size: 16px;
+            color: #2c3e50;
+        }
+        
+        .company {
+            font-style: italic;
+            color: #555;
+            font-size: 15px;
+        }
+        
+        .date {
+            color: #777;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+        
+        ul {
+            margin-left: 20px;
+            margin-top: 8px;
+        }
+        
+        li {
+            margin-bottom: 5px;
+            font-size: 14px;
+        }
+        
+        .skills-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .skill-item {
+            font-size: 14px;
+        }
+        
+        .skill-label {
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        
+        .summary {
+            font-size: 15px;
+            line-height: 1.7;
+            text-align: justify;
+        }
+        
+        .button-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+            display: flex;
+            gap: 10px;
+        }
+        
+        .action-btn {
+            background: #3498db;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            text-decoration: none;
+            display: inline-block;
+        }
+        
+        .action-btn:hover {
+            background: #2980b9;
+        }
+
+        .download-btn {
+            background: #27ae60;
+        }
+        
+        .download-btn:hover {
+            background: #229954;
+        }
+
+        .copy-btn {
+            background: #9b59b6;
+        }
+        
+        .copy-btn:hover {
+            background: #8e44ad;
+        }
+        
+        .instructions {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+
+border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        
+        .instructions h3 {
+            color: #856404;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+        
+        .instructions ol {
+            margin-left: 20px;
+        }
+        
+        .instructions li {
+            margin-bottom: 8px;
+            color: #856404;
+        }
+        
+        @media print {
+            body {
+                padding: 0;
+            }
+            .button-container, .instructions {
+                display: none;
+            }
+            .photo-placeholder {
+                border: 4px solid #3498db;
+                background: white;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="button-container">
+        <a href="https://thunderous-beijinho-db813f.netlify.app/" target="_blank" rel="noopener noreferrer" class="action-btn">🔗 View Portfolio</a>
+    </div>
+
+  
+    <div class="header">
+        <div class="photo-placeholder">
+		<img src="https://drive.google.com/uc?export=view&id=1hbkyhV37LLflqaKOLkVradD7m9Dz6S06" alt="Sin Yi Liaw" style="width: 100%; height: 100%; object-fit: cover; border-radius: 50%;">
+
+
+        </div>
+        
+        <div class="header-text">
+            <h1>Sin Yi Liaw</h1>
+            <div class="contact-info">
+                Bandar Puchong Jaya, 47170<br>
+                📧 liawsinyi567@gmail.com | 📱 +60 18-263 3801<br>
+                🔗 Portfolio: https://thunderous-beijinho-db813f.netlify.app/
+            </div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Professional Summary</h2>
+        <p class="summary">
+            Detail-oriented professional with experience in e-commerce administration, retail coordination, and customer service. Skilled in digital content creation, multi-platform store management, and inventory operations. A quick learner committed to delivering efficient and customer-focused solutions.
+        </p>
+    </div>
+
+    <div class="section">
+        <h2>Work Experience</h2>
+        
+        <div class="job">
+            <div class="job-title">Retail Sales Coordinator</div>
+            <div class="company">Redawn Marketing Bhd</div>
+            <div class="date">Jul 2024 – Nov 2024</div>
+            <ul>
+                <li>Coordinated retail sales activities and ensured smooth day-to-day operations</li>
+                <li>Collaborated with sales and warehouse teams to manage stock and fulfill orders</li>
+                <li>Supported in-store promotions and maintained accurate sales records</li>
+                <li>Delivered responsive customer service to enhance client satisfaction</li>
+            </ul>
+        </div>
+
+<div class="job">
+            <div class="job-title">eCommerce Administrator</div>
+            <div class="company">Eight Twelve Trading Sdn. Bhd. — Seri Kembangan, Selangor</div>
+            <div class="date">Dec 2024 – Present</div>
+            <ul>
+                <li>Edited product visuals using Photopea and Canva</li>
+                <li>Managed TikTok and Shopee store operations</li>
+                <li>Maintained financial records via MySQL accounting system</li>
+            </ul>
+        </div>
+
+        <div class="job">
+            <div class="job-title">eCommerce Administrator &amp; Customer Service</div>
+            <div class="company">Unlimited Library Group — Petaling Jaya</div>
+            <div class="date">Jan 2024 – Dec 2024</div>
+            <ul>
+                <li>Edited product images using Photoshop</li>
+                <li>Managed Lazada and Shopee store listings and orders</li>
+                <li>Responded to customer inquiries promptly and professionally</li>
+            </ul>
+        </div>
+
+        <div class="job">
+            <div class="job-title">eCommerce Administrator &amp; Customer Service</div>
+            <div class="company">Elektrik Shing Hing Sdn. Bhd. — Batu Caves, Selangor</div>
+            <div class="date">Jan 2021 – Dec 2023</div>
+            <ul>
+                <li>Edited product images and optimized listings</li>
+                <li>Operated Lazada and Shopee platforms for daily sales</li>
+                <li>Provided after-sales support and order tracking</li>
+            </ul>
+        </div>
+
+        <div class="job">
+            <div class="job-title">Laser Cutting Machine Operator</div>
+            <div class="company">Universal Standard Steel Engineering Sdn. Bhd. — Cheras, Selangor</div>
+            <div class="date">Jan 2018 – Dec 2018</div>
+            <ul>
+                <li>Designed cutting layouts using AutoCAD</li>
+                <li>Operated laser cutting machines for precision steel fabrication</li>
+            </ul>
+        </div>
+
+        <div class="job">
+            <div class="job-title">Warehouse Assistant</div>
+            <div class="company">Fiamma Holdings Berhad — Kuala Lumpur</div>
+            <div class="date">Jan 2016 – Dec 2017</div>
+            <ul>
+                <li>Prepared packaging materials and managed stock</li>
+                <li>Conducted regular inventory counts</li>
+                <li>Assisted in export documentation and logistics</li>
+            </ul>
+        </div>
+
+        <div class="job">
+            <div class="job-title">Warehouse Assistant</div>
+            <div class="company">Kinsmedic Sdn. Bhd. — Kuala Lumpur</div>
+            <div class="date">Feb 2014 – Dec 2015</div>
+            <ul>
+                <li>Supported packing and warehousing operations</li>
+                <li>Performed stock reconciliation and export calculations</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Education</h2>
+        <div class="job">
+            <div class="job-title">Diploma in Software Engineering and Mobile Application Development</div>
+            <div class="company">New Era Institute of Vocational &amp; Continuing Education — Kajang, Selangor</div>
+            <div class="date">2019 – 2020</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Skills</h2>
+        <div class="skills-grid">
+            <div class="skill-item">
+                <span class="skill-label">Design Tools:</span> Photoshop, Canva, Photopea, AutoCAD
+            </div>
+            <div class="skill-item">
+                <span class="skill-label">E-commerce Platforms:</span> Shopee, Lazada, TikTok Shop
+            </div>
+            <div class="skill-item">
+                <span class="skill-label">Technical:</span> HTML, CSS, JavaScript, PHP, MySQL, Java
+
+</div>
+            <div class="skill-item">
+                <span class="skill-label">Soft Skills:</span> Customer Service, Inventory Coordination, Quick Learner
+            </div>
+        </div>
+        <div style="margin-top: 10px;">
+            <span class="skill-label">Others:</span> Microsoft Office, SaaS Systems
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Certifications &amp; Licenses</h2>
+        <ul>
+            <li>Advanced Diploma in Software Engineering and Mobile Application Development</li>
+            <li>Malaysian Driving License (Class B2)</li>
+        </ul>
+    </div>
+
+    <script>
+        function downloadHTML() {
+            const htmlContent = document.documentElement.outerHTML;
+            const blob = new Blob([htmlContent], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'SinYiLiaw_Resume.html';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        function copyHTML() {
+            const htmlContent = document.documentElement.outerHTML;
+            navigator.clipboard.writeText(htmlContent).then(() => {
+                alert('HTML code copied to clipboard! You can now paste it into a text editor and save as .html file');
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+                alert('Failed to copy. Please use the Download HTML button instead.');
+            });
+        }
+    </script>
+
+</body></html>
